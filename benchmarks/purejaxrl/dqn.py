@@ -1,11 +1,11 @@
 """
 PureJaxRL version of CleanRL's DQN: https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/dqn_jax.py
 """
+from dataclasses import dataclass
+import time
 
-import os
 import jax
 import jax.numpy as jnp
-
 import chex
 import flax
 import optax
@@ -14,8 +14,9 @@ from flax.training.train_state import TrainState
 from gymnax.wrappers.purerl import FlattenObservationWrapper, LogWrapper
 import gymnax
 import flashbax as fbx
+
 from benchmate.metrics import give_push
-import time
+
 
 
 class QNetwork(nn.Module):
@@ -46,9 +47,10 @@ class CustomTrainState(TrainState):
 
 
 def make_train(config):
-
     config["NUM_UPDATES"] = config["TOTAL_TIMESTEPS"] // config["NUM_ENVS"]
-    metric_pusher = give_push()
+
+    from benchmate.timings import StepTimer
+    step_timer = StepTimer(give_push())
 
     basic_env, env_params = gymnax.make(config["ENV_NAME"])
     env = FlattenObservationWrapper(basic_env)
@@ -61,7 +63,7 @@ def make_train(config):
         env.step, in_axes=(0, 0, 0, None)
     )(jax.random.split(rng, n_envs), env_state, action, env_params)
 
-    def train(rng, start_time):
+    def train(rng):
 
         # INIT ENV
         rng, _rng = jax.random.split(rng)
@@ -226,18 +228,19 @@ def make_train(config):
                 "returns": info["returned_episode_returns"].mean(),
             }
 
-            def callback(metrics, start_time):
-                if metrics["timesteps"] % 1000 == 0:
-                    current_time = time.perf_counter()
-                    tsps = metrics["timesteps"] / (current_time - start_time)
-                    ups = metrics["updates"] / (current_time - start_time)
-                    metric_pusher(progress=tsps.item(), units="steps/s")
-                    metric_pusher(update_progress=ups.item(), units="updates/s")
-                    metric_pusher(
-                        returns=metrics["returns"].item(), loss=metrics["loss"].item()
-                    )
+            def callback(metrics):
+                # .block_until_ready()
+                if (metrics["timesteps"] + 1) % 1000:
+                    returns = metrics["returns"].item()
+                    loss = metrics["loss"].block_until_ready().item()
+                    delta = metrics["timesteps"] - step_timer.timesteps
+                    step_timer.timestep = metrics["timesteps"]
+                    
+                    step_timer.step(delta.item())
+                    step_timer.log(returns=returns, loss=loss)
+                    step_timer.end()
 
-            jax.debug.callback(callback, metrics, start_time)
+            jax.debug.callback(callback, metrics)
 
             runner_state = (train_state, buffer_state, env_state, obs, rng)
 
@@ -255,34 +258,67 @@ def make_train(config):
     return train
 
 
-def main():
+@dataclass
+class Arguments:
+    num_envs: int = 10
+    buffer_size: int = 10000
+    buffer_batch_size: int = 128
+    total_timesteps: int = 100_000
+    epsilon_start: float =  1.0
+    epsilon_finish: float = 0.05
+    epsilon_anneal_time: int = 25e4
+    target_update_interval: int = 500
+    lr: float = 2.5e-4
+    learning_starts: int = 10000
+    training_interval: int = 10
+    lr_linear_decay: bool = False
+    gamma: float = 0.99
+    tau: float = 1.0
+    env_name: str = "CartPole-v1"
+    seed: int = 0
+    num_seeds: int = 1
+    project: str = ""
+
+
+def add_dqn_command(subparser):
+    parser = subparser.add_parser('dqn', help='RL dqn benchmark')
+    parser.add_arguments(Arguments)
+
+
+
+def main(args: Arguments = None):
+    if args is None:
+        args = Arguments()
 
     config = {
-        "NUM_ENVS": 10,
-        "BUFFER_SIZE": 10000,
-        "BUFFER_BATCH_SIZE": 128,
-        "TOTAL_TIMESTEPS": 5e5,
-        "EPSILON_START": 1.0,
-        "EPSILON_FINISH": 0.05,
-        "EPSILON_ANNEAL_TIME": 25e4,
-        "TARGET_UPDATE_INTERVAL": 500,
-        "LR": 2.5e-4,
-        "LEARNING_STARTS": 10000,
-        "TRAINING_INTERVAL": 10,
-        "LR_LINEAR_DECAY": False,
-        "GAMMA": 0.99,
-        "TAU": 1.0,
-        "ENV_NAME": "CartPole-v1",
-        "SEED": 0,
-        "NUM_SEEDS": 1,
-        "PROJECT": "",
+        "NUM_ENVS": args.num_envs,
+        "BUFFER_SIZE": args.buffer_size,
+        "BUFFER_BATCH_SIZE": args.buffer_batch_size,
+        "TOTAL_TIMESTEPS": args.total_timesteps,
+        "EPSILON_START": args.epsilon_start,
+        "EPSILON_FINISH": args.epsilon_finish,
+        "EPSILON_ANNEAL_TIME": args.epsilon_anneal_time,
+        "TARGET_UPDATE_INTERVAL": args.target_update_interval,
+        "LR": args.lr,
+        "LEARNING_STARTS": args.learning_starts,
+        "TRAINING_INTERVAL": args.training_interval,
+        "LR_LINEAR_DECAY": args.lr_linear_decay,
+        "GAMMA": args.gamma,
+        "TAU": args.tau,
+        "ENV_NAME": args.env_name,
+        "SEED": args.seed,
+        "NUM_SEEDS": args.num_seeds,
+        "PROJECT": args.project,
     }
 
     rng = jax.random.PRNGKey(config["SEED"])
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    train_vjit = jax.jit(jax.vmap(make_train(config), in_axes=(0, None)))
-    compiled_fn = train_vjit.lower(rngs, 0.0).compile()
-    outs = jax.block_until_ready(compiled_fn(rngs, time.perf_counter()))
+    train_vjit = jax.jit(jax.vmap(make_train(config), in_axes=(0,)))
+    compiled_fn = train_vjit.lower(rngs).compile()
+
+    from benchmate.monitor import bench_monitor
+    with bench_monitor():
+        outs = jax.block_until_ready(compiled_fn(rngs))
 
 
 if __name__ == "__main__":
